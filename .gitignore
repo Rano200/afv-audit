@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+cache/
+out/
+run1/
+audit/
+afv_chunks/
+*.npz
+*.log
+*.jsonl
