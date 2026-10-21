@@ -8,3 +8,4 @@ afv_chunks/
 *.npz
 *.log
 *.jsonl
+run_links/

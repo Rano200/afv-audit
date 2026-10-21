@@ -14,7 +14,8 @@ Stages (each is cached and resumable under --out):
   3. recall      : for the published eval_fibers, take stretches with z in the held-out band, score a <= 600-voxel
                    window of each against the AFV (best single fiber / union of fibers within tol), null = the same
                    window shifted 200 voxels in XY.
-  4. summary     : summary.json and summary.md.
+  4. links       : (only with --links) AFV link precision in the dense cubes; fragmentation along held-out stretches.
+  5. summary     : summary.json and summary.md.
 
 Method is a port of fiberscore/{skeleton_labels,cube_labels,cube_offset,confound_edge}.py and
 fiberprobe_scripts/{stretches,judge,judge_sum}.py; constants and seeds are unchanged. See README.md.
@@ -535,13 +536,263 @@ def summarize_recall(rows, tols, band, n_requested):
     return res
 
 
+# ----------------------------------------------------------------------------------------------- links (optional, --links)
+LINK_TOL, LINK_MIN_PTS, LINK_SEED = 20.0, 30, 7
+FRAG_TOL, FRAG_COVER = 20.0, 0.9
+
+
+def fiber_links(cur, ids, cache=None):
+    """{fiber_id: [linked fiber ids]} from annotation.fiber_follow.links (-1 dropped). `cache` is filled and reused."""
+    cache = {} if cache is None else cache
+    need = [f for f in ids if f not in cache]
+    for s in range(0, len(need), 300):
+        sub = need[s:s + 300]
+        for fid, ann in cur.execute("select id, annotation from fibers where id in (%s)" % ",".join(map(str, sub))):
+            cache[int(fid)] = [int(x) for x in json.loads(ann).get("fiber_follow", {}).get("links", []) if int(x) != -1]
+    return cache
+
+
+def run_link_precision(fibers, cubes):
+    """Link precision inside the dense cubes (port of afv_frag/link_precision.py)."""
+    cur = cursor()
+    by = collections.defaultdict(list)
+    for o in fibers:
+        if o["cube"] in cubes:
+            by[o["cube"]].append(o)
+    rng = np.random.default_rng(LINK_SEED)
+    tot, per_cube = collections.Counter(), {}
+    for cube, fl in sorted(by.items()):
+        dense = [densify(np.array(o["points"], float)) for o in fl]
+        pts = np.concatenate(dense)
+        lab = np.concatenate([np.full(len(d), i) for i, d in enumerate(dense)])
+        tree = cKDTree(pts)
+        lo, hi = pts.min(0) - 30, pts.max(0) + 30
+        per = fetch_blocks(cur, query_blocks(cur, lo, hi))
+        assign = {}
+        for fid, parts in per.items():
+            P = np.concatenate([densify(p) for _, p in parts])
+            P = P[np.all((P >= lo) & (P <= hi), axis=1)]
+            if len(P) == 0:
+                continue
+            d, j = tree.query(P)
+            m = d <= LINK_TOL
+            if m.sum() >= LINK_MIN_PTS:
+                assign[int(fid)] = int(collections.Counter(lab[j[m]]).most_common(1)[0][0])
+        ids = list(assign)
+        links = fiber_links(cur, ids)
+        c = collections.Counter()
+        for f, gs in links.items():  # SQL row order, as in link_precision.py (it fixes the null's rng draws)
+            for g in gs:
+                if g in assign:
+                    c["pairs"] += 1
+                    c["correct"] += assign[f] == assign[g]
+                    h = ids[rng.integers(len(ids))]
+                    c["null_correct"] += assign[f] == assign[h]
+        c["assigned_fibers"] = len(assign)
+        c["fibers_with_links"] = sum(1 for f in ids if links[f])
+        per_cube[cube] = dict(c)
+        tot.update(c)
+        log("  links %s: %s" % (cube, dict(c)))
+    t = dict(tot)
+    return dict(total=t, per_cube=per_cube,
+                precision=(t["correct"] / t["pairs"]) if t.get("pairs") else None,
+                null_precision=(t["null_correct"] / t["pairs"]) if t.get("pairs") else None)
+
+
+def union_cover(R, w, groups):
+    """Share of the weighted stretch within FRAG_TOL of ANY group."""
+    if not groups:
+        return 0.0
+    d, _ = cKDTree(np.concatenate(list(groups.values()))).query(R)
+    return float(w[d <= FRAG_TOL].sum() / w.sum())
+
+
+def near_masks(R, groups):
+    """{key: bool mask over R of points within FRAG_TOL of that group} from ONE KD-tree over all group points."""
+    keys = list(groups)
+    pts = np.concatenate([groups[k] for k in keys])
+    owner = np.concatenate([np.full(len(groups[k]), i) for i, k in enumerate(keys)])
+    hits = cKDTree(pts).query_ball_point(R, FRAG_TOL)
+    masks = np.zeros((len(keys), len(R)), bool)
+    for j, h in enumerate(hits):
+        if h:
+            masks[np.unique(owner[h]), j] = True
+    return {k: masks[i] for i, k in enumerate(keys) if masks[i].any()}
+
+
+def greedy_cover(R, w, groups, target):
+    """Greedy minimum number of groups whose union covers `target` of the weighted stretch; None if unreachable."""
+    near = near_masks(R, groups)
+    total, covered, used = w.sum(), np.zeros(len(R), bool), 0
+    while covered @ w < target * total - 1e-9:
+        best, gain = None, 0.0
+        for k, m in near.items():
+            g = (m & ~covered) @ w
+            if g > gain:
+                best, gain = k, g
+        if best is None:
+            return None
+        covered |= near.pop(best)
+        used += 1
+    return used
+
+
+class UF:
+    def __init__(self):
+        self.p = {}
+
+    def find(self, a):
+        self.p.setdefault(a, a)
+        while self.p[a] != a:
+            self.p[a] = self.p[self.p[a]]
+            a = self.p[a]
+        return a
+
+    def union(self, a, b):
+        self.p[self.find(a)] = self.find(b)
+
+
+def frag_row(cur, name, P, a, b, links_cache):
+    """One held-out stretch -> dict(length, ncand, union20, pieces, chains) (port of afv_frag/frag.py v2)."""
+    R = densify(P[a:b + 1])
+    w = np.linalg.norm(np.diff(R, axis=0), axis=1)
+    w = (np.concatenate([w, [0]]) + np.concatenate([[0], w])) / 2
+    bids = set()
+    for s in range(0, len(R), 100):
+        p = R[s:s + 101]
+        bids.update(query_blocks(cur, p.min(0) - 25, p.max(0) + 25))
+    per = fetch_blocks(cur, bids)
+    groups = {fid: np.concatenate([densify(p) for _, p in parts]) for fid, parts in per.items()}
+    fiber_links(cur, list(groups), links_cache)
+    uf = UF()
+    for f in groups:
+        uf.find(f)
+        for g in links_cache.get(f, []):
+            if g in groups:
+                uf.union(f, g)
+    chains = collections.defaultdict(list)
+    for f, pts in groups.items():
+        chains[uf.find(f)].append(pts)
+    chain_groups = {k: np.concatenate(v) for k, v in chains.items()}
+    u = union_cover(R, w, groups)
+    target = FRAG_COVER * u
+    pieces = greedy_cover(R, w, groups, target) if u > 0 else 0
+    nchains = greedy_cover(R, w, chain_groups, target) if u > 0 else 0
+    return dict(file=name, a=int(a), b=int(b), length=float(w.sum()), ncand=len(groups), union20=u,
+                pieces=pieces, chains=nchains)
+
+
+def run_frag(out, band, sample):
+    """Fragmentation along held-out stretches; resumable via <out>/frag.jsonl (keyed by file, a)."""
+    cur = cursor()
+    files = list_eval_files(out)
+    log("links stage: %d eval_fibers listed; downloading (cached)" % len(files))
+    with cf.ThreadPoolExecutor(8) as ex:
+        evs = list(ex.map(lambda f: (f, np.array(get_eval(out, f)["line_points"], float)), files))
+    st = [(f, a, b) for f, P in evs for a, b, _ in make_stretches(P, band)]
+    log("  in-band stretches: %d" % len(st))
+    if sample and sample < len(st):
+        pick = np.random.default_rng(12345).choice(len(st), sample, replace=False)
+        st = [st[i] for i in sorted(pick)]
+        log("  SAMPLE: %d stretches (rng seed 12345)" % len(st))
+    jl = os.path.join(out, "frag.jsonl")
+    done = {}
+    if os.path.exists(jl):
+        for l in open(jl):
+            try:
+                r = json.loads(l)
+                done[(r["file"], r["a"])] = r
+            except (ValueError, KeyError):
+                pass
+    Pof = dict(evs)
+    links_cache, t0 = {}, time.time()
+    todo = [s for s in st if (s[0], s[1]) not in done]
+    log("  %d done, %d to run" % (len(st) - len(todo), len(todo)))
+    with open(jl, "a") as fo:
+        for n, (f, a, b) in enumerate(todo, 1):
+            r = frag_row(cur, f, Pof[f], a, b, links_cache)
+            fo.write(json.dumps(r) + "\n")
+            fo.flush()
+            done[(f, a)] = r
+            if n % 10 == 0:
+                log("  frag %d/%d (%ds)" % (n, len(todo), time.time() - t0))
+    return [done[(f, a)] for f, a, b in st if (f, a) in done], len(st)
+
+
+def summarize_frag(rows, n_requested):
+    def q(x):
+        x = np.array(x, float)
+        return dict(median=float(np.median(x)), q1=float(np.percentile(x, 25)), q3=float(np.percentile(x, 75)), mean=float(x.mean()))
+    ok = [r for r in rows if r["pieces"] is not None and r["chains"] is not None]
+    L = np.array([r["length"] for r in ok])
+    pc = np.array([r["pieces"] for r in ok], float)
+    ch = np.array([r["chains"] for r in ok], float)
+    cov = [r for r in ok if r["union20"] > 0]
+    return dict(n_stretches=len(rows), n_requested=n_requested, n_scored=len(ok), n_with_any_cover=len(cov),
+                total_length=float(L.sum()), union20=q([r["union20"] for r in ok]), pieces=q(pc), chains=q(ch),
+                pieces_per_1000=q(pc / L * 1000), chains_per_1000=q(ch / L * 1000),
+                pooled_pieces_per_1000=float(pc.sum() / L.sum() * 1000), pooled_chains_per_1000=float(ch.sum() / L.sum() * 1000),
+                pooled_reduction_pct=float(100 * (1 - ch.sum() / pc.sum())) if pc.sum() else None,
+                single_piece=int(sum(1 for r in cov if r["pieces"] == 1)),
+                single_chain=int(sum(1 for r in cov if r["chains"] == 1)))
+
+
 # ----------------------------------------------------------------------------------------------- summary
 def pct(x):
     return "n/a" if x is None else "%.1f%%" % (100 * x)
 
 
-def write_summary(out, prec, rec, args):
+def links_markdown(lk):
+    def f3(v):
+        return "%.2f (%.2f-%.2f)" % (v["median"], v["q1"], v["q3"])
+    L = ["## Links and fragmentation", ""]
+    lp = lk.get("link_precision")
+    if lp is not None:
+        t = lp["total"]
+        L += ["### Link precision (AFV `fiber_follow.links` inside the dense hand-traced cubes)", "",
+              "Each AFV fiber is assigned the hand fiber it follows (majority vote over its in-cube points within %d voxels of a hand "
+              "fiber; needs >= %d such points). A link f->g with both ends assigned is CORRECT if both follow the same hand fiber. "
+              "Null = g replaced by a random assigned fiber in the same cube (rng seed %d)." % (LINK_TOL, LINK_MIN_PTS, LINK_SEED), ""]
+        if t.get("pairs"):
+            L += ["Link precision: **%s** (%d/%d); null %s (%d/%d). Assigned fibers %d, with links %d." % (
+                pct(lp["precision"]), t["correct"], t["pairs"], pct(lp["null_precision"]), t["null_correct"], t["pairs"],
+                t.get("assigned_fibers", 0), t.get("fibers_with_links", 0)), "",
+                "| cube | pairs | correct | null correct |", "|---|---|---|---|"]
+            for c, v in lp["per_cube"].items():
+                L.append("| %s | %d | %d | %d |" % (c, v.get("pairs", 0), v.get("correct", 0), v.get("null_correct", 0)))
+            L.append("")
+        else:
+            L += ["No link had both ends assigned.", ""]
+    fr = lk.get("fragmentation")
+    if fr:
+        L += ["### Fragmentation along held-out human stretches (%d stretches, %d with any AFV fiber within %d voxels%s)" % (
+                  fr["n_stretches"], fr["n_with_any_cover"], FRAG_TOL,
+                  "" if fr["n_stretches"] >= fr["n_requested"] else "; SAMPLE of %d" % fr["n_requested"]), "",
+              "union20 = share of the stretch within %d voxels of ANY AFV fiber. pieces = greedy minimum number of AFV fibers reaching "
+              "%.1f x union20; chains = the same after merging AFV fibers joined through `fiber_follow.links` (union-find over the "
+              "candidates). Median (Q1-Q3)." % (FRAG_TOL, FRAG_COVER), "",
+              "| measure | median (Q1-Q3) |", "|---|---|",
+              "| union20 | %s |" % f3(fr["union20"]), "| pieces | %s |" % f3(fr["pieces"]), "| chains | %s |" % f3(fr["chains"]),
+              "| pieces per 1,000 voxels | %s |" % f3(fr["pieces_per_1000"]),
+              "| chains per 1,000 voxels | %s |" % f3(fr["chains_per_1000"]), "",
+              "Pooled: %.2f pieces and %.2f chains per 1,000 voxels; links cut the count by **%s** pooled. "
+              "Single-piece stretches %d/%d, single-chain %d/%d (of those with any cover)." % (
+                  fr["pooled_pieces_per_1000"], fr["pooled_chains_per_1000"],
+                  "n/a" if fr["pooled_reduction_pct"] is None else "%.1f%%" % fr["pooled_reduction_pct"],
+                  fr["single_piece"], fr["n_with_any_cover"], fr["single_chain"], fr["n_with_any_cover"]), ""]
+    L += ["Caveats for this section:", "",
+          "- Link precision is measured only where BOTH linked fibers fall inside one of the five cubes and have an assignment; "
+          "n is small and the cubes are Scroll 1 only.",
+          "- A wrong link merges two different fibers into one chain, so the chain count (and the pooled reduction) can be flattered "
+          "by merge errors; a chain covering a stretch is not proof it is one real fiber.",
+          "- Fragmentation uses a 20-voxel tolerance and a 90%-of-union target; pieces are a greedy cover, not an exact minimum.", ""]
+    return L
+
+
+def write_summary(out, prec, rec, args, lk=None):
     js = dict(afv=args.afv, precision=prec, recall=rec, tolerances=args.tol)
+    if lk:
+        js["links_and_fragmentation"] = lk
     json.dump(js, open(os.path.join(out, "summary.json"), "w"), indent=1)
     L = ["# AFV audit summary", "", "AFV: `%s`" % args.afv, ""]
     if prec:
@@ -572,6 +823,8 @@ def write_summary(out, prec, rec, args):
                     c, t, s["median"], s["q1"], s["q3"], u["median"], u["q1"], u["q3"], v["single_ge_07"], rec["n_stretches"],
                     cv["any_afv_within_20"]))
         L.append("")
+    if lk:
+        L += links_markdown(lk)
     L += ["## Caveats", "",
           "- BAD windows are AFV fibers with no hand fiber nearby. They may be AFV errors OR fibers the 2025 annotators did not trace; "
           "this audit does not tell which.",
@@ -592,6 +845,9 @@ def main(argv=None):
     ap.add_argument("--skip-recall", action="store_true")
     ap.add_argument("--skip-precision", action="store_true")
     ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--links", action="store_true",
+                    help="also measure link precision in the dense cubes and fragmentation along held-out stretches")
+    ap.add_argument("--links-sample", type=int, default=0, help="with --links: fragmentation on N random in-band stretches (0 = all)")
     args = ap.parse_args(argv)
     out = os.path.abspath(args.out)
     os.makedirs(out, exist_ok=True)
@@ -608,7 +864,16 @@ def main(argv=None):
     if not args.skip_recall:
         rows, n_req = run_recall(out, args.afv, tuple(args.recall_band), tols, args.recall_sample, args.workers)
         rec = summarize_recall(rows, tols, args.recall_band, n_req) if rows else None
-    write_summary(out, prec, rec, args)
+    lk = None
+    if args.links:
+        A, Ainv = load_transform(os.path.join(out, "cache"))
+        fibers = build_cube_labels(out, cubes, Ainv)
+        init_worker(args.afv, out)
+        log("links stage: link precision")
+        link = run_link_precision(fibers, set(cubes))
+        rows, n_req = run_frag(out, tuple(args.recall_band), args.links_sample)
+        lk = dict(link_precision=link, fragmentation=summarize_frag(rows, n_req) if rows else None)
+    write_summary(out, prec, rec, args, lk)
     log("done in %.0fs; see %s" % (time.time() - t0, os.path.join(out, "summary.md")))
 
 

@@ -22,6 +22,30 @@ Not a new tracer, and not a validated filter. The team already audits AFV labels
 - Per cube, BAD ranges from 7.1% to 29.4% (cube 08997z: 7.1%; cube 00497z_01497y: 29.4%), so one number hides real variation.
 - **Open question, stated plainly:** BAD windows are either AFV errors or fibers the 2025 annotators did not trace. A blind visual check at 9.6 um and 2.4 um could not separate a single fiber from the sheet it lies on, so this report does not claim either. Weak hint: BAD windows have lower tube contrast in the CT.
 
+## Links: does following the AFV's own `links` rebuild long fibers? (both judges)
+
+Each AFV fiber stores `fiber_follow.links`, the fibers it continues into at each end.
+
+**Link precision (dense 2025 cubes).** Each AFV fiber inside a cube is assigned the hand fiber it follows (majority vote over its points within 20 voxels of a hand fiber; at least 30 such points; 519 fibers assigned). Of the 138 links whose two ends are both assigned, **110 join two pieces of the same hand fiber (79.7%)**; with a random partner from the same cube instead, 2 of 138 (1.4%) in the exploratory run and 4 of 138 (2.9%) in the packaged tool's random draw. Per cube: 32/36, 27/33, 18/29, 19/26, 14/14. So about one link in five joins two different fibers. Caveat: only links whose two ends are both assigned inside a cube can be scored, so this is a small sample (138 links).
+
+Can join geometry spot the wrong links? Tested with a bar set in advance (AUROC >= 0.70, bootstrap CI above 0.5), no tuning: the angle between the two fibers' end directions gives AUROC 0.66 (95% CI 0.54-0.76) and the endpoint gap 0.55 (0.42-0.69). Wrong links look like correct ones (median join angle 3.9 vs 2.2 degrees; median gap about 47 voxels for both), so a simple geometric filter is not offered.
+
+**Fragmentation (held-out band).** For each in-band stretch of the published human fibers, `union20` is the share within 20 voxels of any AFV fiber, and the count is the fewest AFV pieces (greedy) reaching 90% of that; then the same count after merging pieces connected through `links`.
+
+Over 375 in-band stretches of the published human fibers (median length 4,588 voxels; 2,977,176 voxels in total), the AFV as a whole covers a median **0.97** of each stretch within 20 voxels (quartiles 0.90-1.00); this whole-stretch figure is stricter than the 600-voxel recall windows above.
+
+| | AFV pieces | linked chains |
+|---|---|---|
+| needed per stretch, median | 2 (quartiles 1-4) | 1 (quartiles 1-2) |
+| per 1,000 voxels of human fiber, pooled | 0.45 | 0.22 |
+| stretches covered by a single one | 47% | 62% |
+
+Following `links` cuts the number of pieces needed along a held-out human fiber by **51%** (1330 pieces -> 653 chains). 1 stretch with no AFV fiber nearby is left out of the counts.
+
+Two caveats. The chain count can be slightly optimistic: a wrong link that pulls in a neighbouring fiber's piece lying within 20 voxels of the human stretch still counts toward covering it, and fibers on the same sheet can be that close. And link precision comes from the cubes, which lie outside the held-out band (their CT was seen in training, their labels were not).
+
+Reading: following links stitches the AFV's short pieces into fewer, longer chains along real fibers, at the price of the ~20% wrong joins measured above; anyone building long same-winding constraints from the AFV should weigh both numbers.
+
 ## A possible filter (in-sample, not validated)
 BAD windows sit on short AFV fibers. Dropping fibers shorter than L, on these same windows (thresholds picked after looking):
 

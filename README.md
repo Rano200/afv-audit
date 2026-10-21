@@ -18,6 +18,16 @@ One script, plain Python, Linux / macOS / Windows.
 3. Two cheap sanity checks on (1): the per-cube AFV-to-hand offset (median and MAD of the vector to the nearest hand point), and
    the median distance of GOOD vs BAD windows to the cube faces (detects an edge artifact).
 
+4. **Optional, `--links` (off by default; existing outputs unchanged): links and fragmentation.**
+   - *Link precision.* Inside the five dense cubes each AFV fiber is assigned the hand fiber it follows (majority vote over its
+     in-cube points within 20 voxels of a hand fiber, at least 30 such points). A link `f -> g` from `fiber_follow.links` with both
+     ends assigned is CORRECT if both follow the same hand fiber. Null: `g` replaced by a random assigned fiber in the same cube (rng seed 7).
+   - *Fragmentation.* For each held-out in-band stretch: `union20` = share within 20 voxels of ANY AFV fiber; `pieces` = greedy
+     minimum number of AFV fibers reaching 0.9 x union20; `chains` = the same after merging fibers joined by `fiber_follow.links`
+     (union-find over the candidate fibers). Reported as medians/quartiles, per 1,000 voxels, pooled reduction %, and the share of
+     single-piece / single-chain stretches. Results go in the "Links and fragmentation" section of `summary.md` / `summary.json`;
+     per-stretch rows are appended to `frag.jsonl` (resumable). `--links-sample N` scores N random in-band stretches (seed 12345).
+
 Constants, seeds and window rules are those of the analysis behind REPORT.md, unchanged; RESULTS.md is the reference run's summary.
 
 ## What it does NOT claim
@@ -30,6 +40,9 @@ Constants, seeds and window rules are those of the analysis behind REPORT.md, un
 - Recall windows are capped at 600 voxels, so whole-fiber recall is lower than the window numbers. Recall is "did the AFV find the
   human fiber", not "is every AFV fiber real".
 - Only five cubes, all Scroll 1. The held-out band is held out of the follower's training per its configs; that is not re-verified here.
+- `--links`: link precision is measured only where BOTH linked fibers fall inside a cube and have an assignment (small n, five
+  Scroll 1 cubes); it says nothing about links elsewhere. A wrong link merges different fibers, so the chain count and the pooled
+  reduction can be flattered by merge errors; fewer chains is not proof the chains are real single fibers. Greedy cover is not an exact minimum.
 - The tests use synthetic numbers for mechanics only and prove nothing about any AFV.
 
 ## Run
@@ -40,7 +53,7 @@ python afv_audit.py --afv https://vesuvius-challenge-open-data.s3.amazonaws.com/
 ```
 
 Options: `--recall-band ZLO ZHI`, `--cubes all` (or comma-separated name substrings), `--tol 10 20`,
-`--recall-sample N` (score N random in-band stretches instead of all), `--workers 4`, `--skip-recall`, `--skip-precision`.
+`--recall-sample N` (score N random in-band stretches instead of all), `--workers 4`, `--skip-recall`, `--skip-precision`, `--links`, `--links-sample N`.
 A local `.afv` path works with the standard-library `sqlite3` (no apsw; the file is 11 GB). The `rtree` SQLite module must be present
 (it is in standard CPython builds and in apsw).
 
@@ -57,11 +70,11 @@ RAM: under 1 GB per worker.
 
 - `summary.md`, `summary.json` - the tables (precision per tolerance and per cube, offsets, edge check; recall median / quartiles).
 - `cube_fibers_2026.json` - hand fibers in the 2026 frame. `precision_windows.json` - one row per AFV window with its near-fractions.
-- `recall.jsonl` - one row per scored stretch.
+- `recall.jsonl` - one row per scored stretch. `frag.jsonl` - one row per fragmentation stretch (`--links` only).
 
 ## Tests
 
-`python -m unittest discover -s tests` - checks the transform inversion and the window labelling on a three-point example by hand arithmetic.
+`python -m unittest discover -s tests` - checks the transform inversion and the window labelling on a three-point example by hand arithmetic, and the greedy cover / union-find mechanics on synthetic lines.
 
 ## Known differences from the draft report
 

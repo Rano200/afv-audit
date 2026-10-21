@@ -67,5 +67,39 @@ class WindowTest(unittest.TestCase):
         self.assertEqual(T.label_from_fraction(float((dn <= 20).mean())), "BAD")
 
 
+class LinksMechanicsTest(unittest.TestCase):
+    """Synthetic greedy-cover / union-find mechanics for --links. No claim about any AFV."""
+
+    def _line(self, x0, x1):
+        return np.c_[np.arange(x0, x1 + 1, dtype=float), np.zeros(x1 - x0 + 1), np.zeros(x1 - x0 + 1)]
+
+    def test_union_find(self):
+        uf = T.UF()
+        for a, b in [(1, 2), (3, 4), (2, 3)]:
+            uf.union(a, b)
+        uf.find(9)
+        self.assertEqual(len({uf.find(i) for i in (1, 2, 3, 4)}), 1)
+        self.assertNotEqual(uf.find(9), uf.find(1))
+
+    def test_greedy_cover_pieces_vs_chains(self):
+        R = self._line(0, 99)
+        w = np.ones(len(R))
+        groups = {1: self._line(0, 49), 2: self._line(50, 99), 3: self._line(0, 10), 4: self._line(0, 99) + [0, 500, 0]}
+        # fibers 1 and 2 each cover half; 3 is a subset of 1; 4 is far away (never near)
+        self.assertAlmostEqual(T.union_cover(R, w, groups), 1.0)
+        self.assertEqual(T.greedy_cover(R, w, groups, 0.9), 2)
+        # linking 1 and 2 into one chain -> one chain covers the stretch
+        uf = T.UF()
+        uf.union(1, 2)
+        ch = {}
+        for f, p in groups.items():
+            ch.setdefault(uf.find(f), []).append(p)
+        chain_groups = {k: np.concatenate(v) for k, v in ch.items()}
+        self.assertEqual(T.greedy_cover(R, w, chain_groups, 0.9), 1)
+        # unreachable target -> None
+        self.assertIsNone(T.greedy_cover(R, w, {3: groups[3]}, 0.9))
+        self.assertEqual(T.greedy_cover(R, w, {3: groups[3]}, 0.05), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
