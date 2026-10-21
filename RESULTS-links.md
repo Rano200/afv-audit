@@ -10,7 +10,7 @@ all 219 stretches they both computed.
 | | links | correct | share |
 |---|---|---|---|
 | both ends assigned to a hand fiber | 138 | 110 | 79.7% |
-| null: random assigned partner, same cube | 138 | 2-4 (depends on the random draw) | 1.4-2.9% |
+| null: random assigned partner, same cube | 138 | 2 | 1.4% |
 
 Per cube: 32/36, 27/33, 18/29, 19/26, 14/14. Join geometry does not separate wrong links from correct ones (join-angle
 AUROC 0.66, 95% CI 0.54-0.76; endpoint-gap AUROC 0.55, 0.42-0.69; pre-registered bar 0.70).
